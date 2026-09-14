@@ -52,6 +52,28 @@ public class ShellApplication extends Application {
 
     static {
         bypassHiddenApiRestrictions();
+        // libshell.so is deliberately NOT loaded here - see ensureNativeLoaded.
+    }
+
+    private static boolean sNativeLoaded = false;
+
+    /**
+     * Loads libshell.so once. Callers must seed the payload native directory
+     * first.
+     *
+     * <p>This process's first native load is what makes libnativeloader create
+     * the linker namespace for the application's PathClassLoader, and the
+     * namespace snapshots {@code getLdLibraryPath()} at that instant and never
+     * refreshes it. Loading from the static initializer therefore freezes the
+     * search path to the APK's own lib directory, which after packing contains
+     * nothing but libshell.so; every payload .so decrypted into the cache
+     * directory is then rejected as inaccessible on Android 7, and payload
+     * libraries also cannot resolve their {@code DT_NEEDED} siblings.
+     */
+    static synchronized void ensureNativeLoaded() {
+        if (sNativeLoaded)
+            return;
+        sNativeLoaded = true;
         try {
             System.loadLibrary("shell");
         } catch (UnsatisfiedLinkError e) {
@@ -72,6 +94,12 @@ public class ShellApplication extends Application {
     public static synchronized void ensureDexLoaded(Context context) {
         if (sDexLoaded)
             return;
+        // Must happen before ensureNativeLoaded(): the payload directory has to
+        // be inside getLdLibraryPath() when the linker namespace is created.
+        // Mirrors libs_dir in lib.rs, "<getCacheDir()>/native_libs".
+        NativeLibLoader.seedNativeLibraryDir(context.getClassLoader(),
+                context.getCacheDir().getAbsolutePath() + "/native_libs");
+        ensureNativeLoaded();
         new ShellApplication().nativeLoadDex(context, android.os.Build.VERSION.SDK_INT);
         sDexLoaded = true;
     }
@@ -79,6 +107,12 @@ public class ShellApplication extends Application {
     public static synchronized void ensureDexLoaded(android.content.pm.ApplicationInfo appInfo, ClassLoader cl) {
         if (sDexLoaded)
             return;
+        // No Context on this path, so build the directory the way lib.rs does:
+        // "<dataDir>/cache/native_libs".
+        if (appInfo.dataDir != null) {
+            NativeLibLoader.seedNativeLibraryDir(cl, appInfo.dataDir + "/cache/native_libs");
+        }
+        ensureNativeLoaded();
         nativeLoadDexWithAppInfo(appInfo, cl, android.os.Build.VERSION.SDK_INT);
         sDexLoaded = true;
     }

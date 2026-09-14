@@ -10,11 +10,12 @@ public class BootstrapProvider extends ContentProvider {
     private static final String TAG = "BootstrapProvider";
 
     static {
-        try {
-            System.loadLibrary("shell");
-        } catch (UnsatisfiedLinkError e) {
-            Log.e(TAG, "Failed to load native library", e);
-        }
+        // Single load site. Providers are installed after
+        // Application.attachBaseContext, so ShellApplication has already seeded
+        // the linker namespace with the payload native directory by now; loading
+        // libshell.so straight from here would risk creating that namespace
+        // first, without the seed. See ShellApplication.ensureNativeLoaded.
+        ShellApplication.ensureNativeLoaded();
     }
 
     private static native void nativeLoadDex(android.content.Context context, int sdkInt);

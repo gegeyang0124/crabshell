@@ -6,6 +6,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce
 };
 use std::os::raw::c_void;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -482,7 +483,7 @@ fn load_dex_core(
     // Serialize all disk landing across processes. The lock is held only for
     // the file-writing phase and released before the per-process JNI
     // class-loader registration (which must run in every process).
-    let (dex_paths, libs_dir, dex_cache_dir) = {
+    let (dex_paths, libs_dir, dex_opt_dir) = {
         let _land_lock = ProcessLock::acquire(&format!("{}/kapp_land.lock", cache_path));
 
         // 1. Extract assets (shared file) under the lock.
@@ -503,7 +504,7 @@ fn load_dex_core(
     };
 
     // 3. Register the landed dex/native paths on THIS process's class loader.
-    register_payload_on_loader(env, class_loader, &dex_paths, &libs_dir, &dex_cache_dir)
+    register_payload_on_loader(env, class_loader, &dex_paths, &libs_dir, &dex_opt_dir)
         .map_err(|e| e.into())
 }
 
@@ -647,12 +648,14 @@ fn extract_signature_bytes(
                     &[],
                 )?
                 .l()?;
-            let signers_array: JObjectArray = signers_obj.into();
-            if env.get_array_length(&signers_array)? > 0 {
-                let signature = env.get_object_array_element(&signers_array, 0)?;
-                let cert_bytes_j = env.call_method(&signature, "toByteArray", "()[B", &[])?.l()?;
-                let cert_bytes: Vec<u8> = env.convert_byte_array(&JByteArray::from(cert_bytes_j))?;
-                return Ok(Some(cert_bytes));
+            if !signers_obj.is_null() {
+                let signers_array: JObjectArray = signers_obj.into();
+                if env.get_array_length(&signers_array)? > 0 {
+                    let signature = env.get_object_array_element(&signers_array, 0)?;
+                    let cert_bytes_j = env.call_method(&signature, "toByteArray", "()[B", &[])?.l()?;
+                    let cert_bytes: Vec<u8> = env.convert_byte_array(&JByteArray::from(cert_bytes_j))?;
+                    return Ok(Some(cert_bytes));
+                }
             }
         }
     } else {
@@ -663,12 +666,17 @@ fn extract_signature_bytes(
         .get_field(package_info, "signatures", "[Landroid/content/pm/Signature;")
         .and_then(|value| value.l())
     {
-        let signatures_array: JObjectArray = signatures_obj.into();
-        if env.get_array_length(&signatures_array)? > 0 {
-            let signature = env.get_object_array_element(&signatures_array, 0)?;
-            let cert_bytes_j = env.call_method(&signature, "toByteArray", "()[B", &[])?.l()?;
-            let cert_bytes: Vec<u8> = env.convert_byte_array(&JByteArray::from(cert_bytes_j))?;
-            return Ok(Some(cert_bytes));
+        // PackageInfo.signatures is only populated when the caller asked for
+        // GET_SIGNATURES. A null array is therefore a "not requested" signal,
+        // not a JNI error - GetArrayLength on it would abort the loader.
+        if !signatures_obj.is_null() {
+            let signatures_array: JObjectArray = signatures_obj.into();
+            if env.get_array_length(&signatures_array)? > 0 {
+                let signature = env.get_object_array_element(&signatures_array, 0)?;
+                let cert_bytes_j = env.call_method(&signature, "toByteArray", "()[B", &[])?.l()?;
+                let cert_bytes: Vec<u8> = env.convert_byte_array(&JByteArray::from(cert_bytes_j))?;
+                return Ok(Some(cert_bytes));
+            }
         }
     } else {
         let _ = env.exception_clear();
@@ -677,10 +685,35 @@ fn extract_signature_bytes(
     Ok(None)
 }
 
+fn get_package_info<'local>(
+    env: &mut JNIEnv<'local>,
+    pm: &JObject<'local>,
+    package_name: &JObject<'local>,
+    flags: i32,
+) -> Result<JObject<'local>, jni::errors::Error> {
+    env.call_method(
+        pm,
+        "getPackageInfo",
+        "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;",
+        &[package_name.into(), flags.into()],
+    )?
+    .l()
+}
+
 fn verify_integrity(
     env: &mut JNIEnv,
     context: &JObject,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Nothing to compare against: the packer embedded a zero hash (e.g. it was
+    // started with --no-sign and no keystore). Skip the whole PackageManager
+    // round-trip instead of failing on it - the comparison below is a no-op
+    // anyway, and a failure here would silently stop the payload dex from ever
+    // being loaded, killing the app with ClassNotFoundException at startup.
+    if EXPECTED_SIGNATURE_HASH.iter().all(|&b| b == 0) {
+        warn!("Signature hash check skipped (embedded hash is zero).");
+        return Ok(());
+    }
+
     info!("Verifying APK signature...");
     let package_name = env.call_method(context, "getPackageName", "()Ljava/lang/String;", &[])?.l()?;
     let pm = env.call_method(context, "getPackageManager", "()Landroid/content/pm/PackageManager;", &[])?.l()?;
@@ -688,27 +721,35 @@ fn verify_integrity(
     // Prefer modern flag first (API 28+), then fallback to legacy flag.
     const GET_SIGNING_CERTIFICATES: i32 = 0x08000000;
     const GET_SIGNATURES: i32 = 64;
-    let package_info = match env.call_method(
-        &pm,
-        "getPackageInfo",
-        "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;",
-        &[(&package_name).into(), GET_SIGNING_CERTIFICATES.into()],
-    ) {
-        Ok(value) => value.l()?,
-        Err(_) => {
-            let _ = env.exception_clear();
-            env.call_method(
-                &pm,
-                "getPackageInfo",
-                "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;",
-                &[(&package_name).into(), GET_SIGNATURES.into()],
-            )?
-            .l()?
-        }
-    };
 
-    let cert_bytes = extract_signature_bytes(env, &package_info)?
-        .ok_or("No signatures found in PackageInfo")?;
+    // On API 24-27 GET_SIGNING_CERTIFICATES is an unknown bit: getPackageInfo
+    // still succeeds, but PackageInfo carries neither signingInfo nor
+    // signatures. That must NOT be treated as a hard failure, otherwise the
+    // shell aborts before loading the payload on every pre-Android 9 device.
+    let mut cert_bytes: Option<Vec<u8>> = None;
+    match get_package_info(env, &pm, &package_name, GET_SIGNING_CERTIFICATES) {
+        Ok(package_info) => match extract_signature_bytes(env, &package_info) {
+            Ok(bytes) => cert_bytes = bytes,
+            Err(e) => {
+                debug!("Reading SigningInfo failed, will retry with GET_SIGNATURES: {:?}", e);
+                let _ = env.exception_clear();
+            }
+        },
+        Err(e) => {
+            debug!(
+                "getPackageInfo(GET_SIGNING_CERTIFICATES) failed, will retry with GET_SIGNATURES: {:?}",
+                e
+            );
+            let _ = env.exception_clear();
+        }
+    }
+
+    if cert_bytes.is_none() {
+        let package_info = get_package_info(env, &pm, &package_name, GET_SIGNATURES)?;
+        cert_bytes = extract_signature_bytes(env, &package_info)?;
+    }
+
+    let cert_bytes = cert_bytes.ok_or("No signatures found in PackageInfo")?;
 
     let mut hasher = Sha256::new();
     hasher.update(&cert_bytes);
@@ -1056,7 +1097,7 @@ fn inject_dex_via_helper_loader(
     target_loader: &JObject,
     joined_dex_paths: &str,
     libs_dir: &str,
-    dex_cache_dir: &str,
+    dex_opt_dir: &str,
 ) -> Result<(), jni::errors::Error> {
     // The helper loader is the only loader opening these dex files, so the
     // ART "multiple class loaders" dex registration conflict cannot happen.
@@ -1064,7 +1105,7 @@ fn inject_dex_via_helper_loader(
         env,
         target_loader,
         joined_dex_paths,
-        Some(dex_cache_dir),
+        Some(dex_opt_dir),
         libs_dir,
     )?;
 
@@ -1160,11 +1201,171 @@ fn inject_native_dir_from_loader(
         JValue::Object(&new_array_obj),
     )?;
 
+    // DexPathList.addNativePath() keeps two fields in sync; mirror that. See
+    // add_native_library_directory for why the second one matters.
+    add_native_library_directory(env, &target_path_list, libs_dir);
+
     info!(
         "inject_native_dir_from_loader: registered {} into native library path",
         libs_dir
     );
     Ok(())
+}
+
+/// Companion to the nativeLibraryPathElements injection: also append `libs_dir`
+/// to DexPathList.nativeLibraryDirectories.
+///
+/// The framework's own DexPathList.addNativePath() updates BOTH fields. The
+/// Element array drives findLibrary() (name -> absolute path), while the List
+/// drives BaseDexClassLoader.getLdLibraryPath(), which is the value libnativeloader
+/// hands to android_create_namespace() as the namespace's ld_library_path. Only
+/// patching the Elements therefore leaves any namespace created after this point
+/// (a child loader, a plugin framework, a WebView-style provider) searching a
+/// stale path in which the payload libraries no longer exist.
+///
+/// Purely best-effort: the field is private, may be absent on OEM builds and may
+/// hold an immutable List, none of which must stop the loader.
+fn add_native_library_directory(env: &mut JNIEnv, path_list: &JObject, libs_dir: &str) {
+    let dirs_obj = match env
+        .get_field(path_list, "nativeLibraryDirectories", "Ljava/util/List;")
+        .and_then(|value| value.l())
+    {
+        Ok(value) if !value.is_null() => value,
+        _ => {
+            let _ = env.exception_clear();
+            debug!("add_native_library_directory: nativeLibraryDirectories unavailable");
+            return;
+        }
+    };
+
+    let file_cls = match env.find_class("java/io/File") {
+        Ok(cls) => cls,
+        Err(e) => {
+            let _ = env.exception_clear();
+            warn!("add_native_library_directory: cannot resolve java/io/File: {:?}", e);
+            return;
+        }
+    };
+
+    let dir_str = match env.new_string(libs_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = env.exception_clear();
+            warn!("add_native_library_directory: new_string failed: {:?}", e);
+            return;
+        }
+    };
+    let dir_str_obj = JObject::from(dir_str);
+
+    let file = match env.new_object(
+        &file_cls,
+        "(Ljava/lang/String;)V",
+        &[JValue::Object(&dir_str_obj)],
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = env.exception_clear();
+            warn!("add_native_library_directory: new File failed: {:?}", e);
+            return;
+        }
+    };
+
+    // File.equals compares paths, so this is a real duplicate check - the
+    // loader may already know about libs_dir through addNativePath().
+    // JValueGen::z() consumes its receiver, so the flag has to be read outside
+    // the match: a pattern guard may only borrow the binding it tests.
+    let already_present = match env.call_method(
+        &dirs_obj,
+        "contains",
+        "(Ljava/lang/Object;)Z",
+        &[JValue::Object(&file)],
+    ) {
+        Ok(value) => value.z().unwrap_or(false),
+        Err(e) => {
+            let _ = env.exception_clear();
+            warn!("add_native_library_directory: contains failed: {:?}", e);
+            return;
+        }
+    };
+    if already_present {
+        return;
+    }
+
+    match env.call_method(
+        &dirs_obj,
+        "add",
+        "(Ljava/lang/Object;)Z",
+        &[JValue::Object(&file)],
+    ) {
+        Ok(_) => info!(
+            "add_native_library_directory: added {} to nativeLibraryDirectories",
+            libs_dir
+        ),
+        Err(e) => {
+            let _ = env.exception_clear();
+            warn!(
+                "add_native_library_directory: cannot extend nativeLibraryDirectories: {:?}",
+                e
+            );
+        }
+    }
+}
+
+/// List every .so inside `libs_dir`, sorted so the load order is reproducible.
+fn collect_so_paths(libs_dir: &str) -> Vec<String> {
+    let dir = match std::fs::read_dir(libs_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("collect_so_paths: cannot read {}: {}", libs_dir, e);
+            return Vec::new();
+        }
+    };
+
+    let mut so_paths: Vec<String> = Vec::new();
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("so") {
+            if let Some(p) = path.to_str() {
+                so_paths.push(p.to_string());
+            }
+        }
+    }
+    so_paths.sort();
+    so_paths
+}
+
+/// System.load() the paths through com.kapp.shell.NativeLibLoader.
+///
+/// Calling System.load straight from JNI makes Runtime.load0 resolve the owning
+/// loader with Reflection.getCallerClass(), which does not reliably yield the
+/// app's PathClassLoader when the caller is native code. ART then registers the
+/// library against the wrong loader, and since FindCodeForNativeMethod only
+/// searches the libraries owned by the *declaring* class's loader, every native
+/// method of the payload keeps failing with "No implementation found". Routing
+/// the call through a bootstrap-dex class pins the ownership.
+///
+/// Returns the number of paths the helper could not load.
+fn load_paths_via_java(env: &mut JNIEnv, paths: &[String]) -> Result<i32, jni::errors::Error> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+
+    let loader_cls = env.find_class("com/kapp/shell/NativeLibLoader")?;
+    let string_cls = env.find_class("java/lang/String")?;
+    let array = env.new_object_array(paths.len() as i32, &string_cls, JObject::null())?;
+    for (idx, path) in paths.iter().enumerate() {
+        let jpath = env.new_string(path)?;
+        env.set_object_array_element(&array, idx as i32, jpath)?;
+    }
+
+    let array_obj = JObject::from(array);
+    env.call_static_method(
+        &loader_cls,
+        "loadInOrder",
+        "([Ljava/lang/String;)I",
+        &[JValue::Object(&array_obj)],
+    )?
+    .i()
 }
 
 /// Third fallback for native lib registration: directly System.load() each
@@ -1176,68 +1377,340 @@ fn preload_native_libs_direct(
     env: &mut JNIEnv,
     libs_dir: &str,
 ) -> Result<(), jni::errors::Error> {
-    let system_cls = env.find_class("java/lang/System")?;
-    let load_method = env.get_static_method_id(&system_cls, "load", "(Ljava/lang/String;)V")?;
-
-    let dir = match std::fs::read_dir(libs_dir) {
-        Ok(d) => d,
-        Err(e) => {
-            warn!("preload_native_libs_direct: cannot read {}: {}", libs_dir, e);
-            return Ok(());
-        }
-    };
-
-    // Collect .so paths and sort them (deterministic load order).
-    let mut so_paths: Vec<String> = Vec::new();
-    for entry in dir {
-        if let Ok(entry) = entry {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("so") {
-                if let Some(p) = path.to_str() {
-                    so_paths.push(p.to_string());
-                }
-            }
-        }
-    }
-    so_paths.sort();
-
-    let mut loaded = 0;
-    for path in &so_paths {
-        let jpath = match env.new_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("preload_native_libs_direct: new_string failed for {}: {:?}", path, e);
-                continue;
-            }
-        };
-        // System.load is a well-known public API; safe to call unchecked.
-        let result = unsafe {
-            env.call_static_method_unchecked(
-                &system_cls,
-                load_method,
-                jni::signature::ReturnType::Primitive(jni::signature::Primitive::Void),
-                &[JValue::Object(&jpath).as_jni()],
-            )
-        };
-        match result {
-            Ok(_) => {
-                loaded += 1;
-                info!("preload_native_libs_direct: loaded {}", path);
-            }
-            Err(e) => {
-                warn!("preload_native_libs_direct: failed to load {}: {:?}", path, e);
-                // Clear the pending exception so it doesn't propagate to Java.
-                if env.exception_check().unwrap_or(false) {
-                    let _ = env.exception_clear();
-                }
-            }
-        }
+    let so_paths = collect_so_paths(libs_dir);
+    if so_paths.is_empty() {
+        return Ok(());
     }
 
+    let failures = load_paths_via_java(env, &so_paths)?;
     info!(
         "preload_native_libs_direct: pre-loaded {}/{} .so files from {}",
-        loaded,
+        so_paths.len().saturating_sub(failures as usize),
         so_paths.len(),
+        libs_dir
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ElfDeps {
+    soname: String,
+    needed: Vec<String>,
+}
+
+fn elf_u16(data: &[u8], off: usize, le: bool) -> Option<u16> {
+    let b = data.get(off..off + 2)?;
+    Some(if le {
+        u16::from_le_bytes([b[0], b[1]])
+    } else {
+        u16::from_be_bytes([b[0], b[1]])
+    })
+}
+
+fn elf_u32(data: &[u8], off: usize, le: bool) -> Option<u32> {
+    let b = data.get(off..off + 4)?;
+    Some(if le {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    } else {
+        u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+    })
+}
+
+fn elf_u64(data: &[u8], off: usize, le: bool) -> Option<u64> {
+    let b = data.get(off..off + 8)?;
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(b);
+    Some(if le {
+        u64::from_le_bytes(raw)
+    } else {
+        u64::from_be_bytes(raw)
+    })
+}
+
+/// Fill `buf` from the file's current position and report how many bytes were
+/// actually read. A short read is not an error: callers parse what they got.
+fn read_up_to(file: &mut File, buf: &mut [u8]) -> Option<usize> {
+    let mut total = 0;
+    while total < buf.len() {
+        match file.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    Some(total)
+}
+
+/// Read DT_SONAME and the DT_NEEDED list out of an ELF file.
+///
+/// Hand-rolled on purpose: this runs on every startup for a handful of decrypted
+/// .so files, and pulling in a parsing crate would grow libshell.so (and its own
+/// dependency closure) for no benefit. Only the header, the program headers, the
+/// dynamic section and the dynamic string table are read - the payload libraries
+/// here run into tens of megabytes, so slurping them whole would be a needless
+/// allocation on 32-bit devices. Anything that is not a readable, well-formed ELF
+/// yields None so the caller can skip it.
+fn read_elf_deps(path: &str) -> Option<ElfDeps> {
+    let mut file = File::open(path).ok()?;
+
+    // 64 bytes covers both the ELF32 and the ELF64 header layout.
+    let mut ehdr = [0u8; 64];
+    if file.read_exact(&mut ehdr).is_err() {
+        return None;
+    }
+    if &ehdr[0..4] != b"\x7fELF" {
+        return None;
+    }
+    let is64 = ehdr[4] == 2;
+    let le = ehdr[5] != 2;
+
+    let (phoff, phentsize, phnum) = if is64 {
+        (
+            elf_u64(&ehdr, 0x20, le)?,
+            elf_u16(&ehdr, 0x36, le)? as usize,
+            elf_u16(&ehdr, 0x38, le)? as usize,
+        )
+    } else {
+        (
+            elf_u32(&ehdr, 0x1c, le)? as u64,
+            elf_u16(&ehdr, 0x2a, le)? as usize,
+            elf_u16(&ehdr, 0x2c, le)? as usize,
+        )
+    };
+
+    // Sanity caps: keep the allocation and index arithmetic below bounded even
+    // when the header is garbage. Real files have a handful of segments.
+    if phentsize < 32 || phentsize > 512 || phnum == 0 || phnum > 512 {
+        return None;
+    }
+
+    let mut phdrs = vec![0u8; phnum * phentsize];
+    file.seek(SeekFrom::Start(phoff)).ok()?;
+    file.read_exact(&mut phdrs).ok()?;
+
+    let mut loads: Vec<(u64, u64, u64)> = Vec::new();
+    let mut dyn_seg: Option<(u64, u64)> = None;
+
+    for i in 0..phnum {
+        let base = i * phentsize;
+        let p_type = elf_u32(&phdrs, base, le)?;
+        let (p_offset, p_vaddr, p_filesz) = if is64 {
+            (
+                elf_u64(&phdrs, base + 8, le)?,
+                elf_u64(&phdrs, base + 16, le)?,
+                elf_u64(&phdrs, base + 32, le)?,
+            )
+        } else {
+            (
+                elf_u32(&phdrs, base + 4, le)? as u64,
+                elf_u32(&phdrs, base + 8, le)? as u64,
+                elf_u32(&phdrs, base + 16, le)? as u64,
+            )
+        };
+        if p_type == 1 {
+            // PT_LOAD: remembered so DT_STRTAB's virtual address can be turned
+            // back into an offset inside this file.
+            loads.push((p_vaddr, p_offset, p_filesz));
+        } else if p_type == 2 {
+            dyn_seg = Some((p_offset, p_filesz));
+        }
+    }
+
+    let (dyn_off, dyn_size) = dyn_seg?;
+    // A shared library carries a few hundred dynamic entries at most.
+    let dyn_len = dyn_size.min(1 << 20) as usize;
+    if dyn_len == 0 {
+        return None;
+    }
+    let mut dynamic = vec![0u8; dyn_len];
+    file.seek(SeekFrom::Start(dyn_off)).ok()?;
+    let dyn_len = read_up_to(&mut file, &mut dynamic)?;
+
+    const DT_NULL: u64 = 0;
+    const DT_NEEDED: u64 = 1;
+    const DT_STRTAB: u64 = 5;
+    const DT_STRSZ: u64 = 10;
+    const DT_SONAME: u64 = 14;
+
+    let entry_size: usize = if is64 { 16 } else { 8 };
+    let mut strtab_va: u64 = 0;
+    let mut strtab_size: u64 = 0;
+    let mut soname_off: Option<u64> = None;
+    let mut needed_offs: Vec<u64> = Vec::new();
+
+    let mut off = 0usize;
+    while off + entry_size <= dyn_len {
+        let (tag, val) = if is64 {
+            (elf_u64(&dynamic, off, le)?, elf_u64(&dynamic, off + 8, le)?)
+        } else {
+            (
+                elf_u32(&dynamic, off, le)? as u64,
+                elf_u32(&dynamic, off + 4, le)? as u64,
+            )
+        };
+        match tag {
+            DT_NULL => break,
+            DT_NEEDED => needed_offs.push(val),
+            DT_STRTAB => strtab_va = val,
+            DT_STRSZ => strtab_size = val,
+            DT_SONAME => soname_off = Some(val),
+            _ => {}
+        }
+        off += entry_size;
+    }
+
+    let strtab_off = loads.iter().find_map(|&(vaddr, file_off, filesz)| {
+        if strtab_va >= vaddr && strtab_va < vaddr + filesz {
+            Some(strtab_va - vaddr + file_off)
+        } else {
+            None
+        }
+    })?;
+
+    let strtab_len = strtab_size.min(1 << 20) as usize;
+    if strtab_len == 0 {
+        return None;
+    }
+    let mut strtab = vec![0u8; strtab_len];
+    file.seek(SeekFrom::Start(strtab_off)).ok()?;
+    let strtab_len = read_up_to(&mut file, &mut strtab)?;
+
+    let read_str = |str_off: u64| -> Option<String> {
+        if str_off >= strtab_len as u64 {
+            return None;
+        }
+        let bytes = strtab.get(str_off as usize..strtab_len)?;
+        let end = bytes.iter().position(|&b| b == 0)?;
+        String::from_utf8(bytes[..end].to_vec()).ok()
+    };
+
+    Some(ElfDeps {
+        soname: soname_off.and_then(|o| read_str(o)).unwrap_or_default(),
+        needed: needed_offs.iter().filter_map(|o| read_str(*o)).collect(),
+    })
+}
+
+/// Post-order DFS over the DT_NEEDED graph, so every library ends up in
+/// `ordered` before the libraries that need it. The visited set doubles as cycle
+/// protection - real .so files do contain DT_NEEDED back-edges.
+fn visit_native_deps(
+    path: &str,
+    needed: &HashMap<String, Vec<String>>,
+    visited: &mut HashSet<String>,
+    ordered: &mut Vec<String>,
+) {
+    if !visited.insert(path.to_string()) {
+        return;
+    }
+    if let Some(deps) = needed.get(path) {
+        for dep in deps {
+            visit_native_deps(dep, needed, visited, ordered);
+        }
+    }
+    ordered.push(path.to_string());
+}
+
+/// Pre-load the payload libraries that another payload library depends on.
+///
+/// This is NOT redundant with the classloader patching above, and it is the
+/// reason a hardened build can fail with "No implementation found" while the
+/// unhardened one works:
+///
+/// On API 24+ every app ClassLoader gets an isolated linker namespace whose
+/// ld_library_path is snapshotted from BaseDexClassLoader.getLdLibraryPath() the
+/// first time a library is loaded through it - here, ShellApplication's static
+/// block loading libshell.so, long before the payload is decrypted. Patching
+/// DexPathList afterwards cannot un-freeze it. So when the linker later resolves
+/// libbdface_sdk.so's DT_NEEDED entries it searches only (a) libraries already
+/// loaded in the namespace and (b) that stale path, from which the packer has
+/// stripped every app-supplied .so. dlopen fails, the SDK swallows the
+/// UnsatisfiedLinkError in its own static initializer, and every native method
+/// of the SDK then reports "No implementation found".
+///
+/// Pre-loading the dependencies satisfies (a).
+///
+/// Only libraries that a sibling actually DT_NEEDEDs are loaded. Force-loading
+/// everything would be wrong here: a payload may carry two files sharing one
+/// SONAME (a vendor-renamed variant), and loading the wrong one first shadows
+/// the right one for the whole process.
+fn preload_shared_native_deps(env: &mut JNIEnv, libs_dir: &str) -> Result<(), jni::errors::Error> {
+    let so_paths = collect_so_paths(libs_dir);
+    if so_paths.len() < 2 {
+        return Ok(());
+    }
+
+    let mut parsed: Vec<(String, ElfDeps)> = Vec::new();
+    for path in &so_paths {
+        match read_elf_deps(path) {
+            Some(deps) => parsed.push((path.clone(), deps)),
+            None => debug!("preload_shared_native_deps: not a parsable ELF: {}", path),
+        }
+    }
+    if parsed.is_empty() {
+        return Ok(());
+    }
+
+    // soname -> path. File names are inserted first and DT_SONAME only fills the
+    // gaps, because that is what the linker does: it looks for a file with that
+    // name. This keeps a renamed variant (libdk_serial_port.so carrying SONAME
+    // libserial_port.so) from hijacking lookups for the real libserial_port.so.
+    let mut by_soname: HashMap<String, String> = HashMap::new();
+    for (path, _) in &parsed {
+        if let Some(name) = path.rsplit('/').next() {
+            by_soname.insert(name.to_string(), path.clone());
+        }
+    }
+    for (path, deps) in &parsed {
+        if !deps.soname.is_empty() {
+            by_soname
+                .entry(deps.soname.clone())
+                .or_insert_with(|| path.clone());
+        }
+    }
+
+    // Reduce DT_NEEDED sonames to the payload paths they resolve to.
+    let mut needed_by_path: HashMap<String, Vec<String>> = HashMap::new();
+    let mut required: Vec<String> = Vec::new();
+    for (path, deps) in &parsed {
+        let mut resolved: Vec<String> = Vec::new();
+        for soname in &deps.needed {
+            if let Some(dep) = by_soname.get(soname) {
+                if dep != path {
+                    resolved.push(dep.clone());
+                    required.push(dep.clone());
+                }
+            }
+        }
+        needed_by_path.insert(path.clone(), resolved);
+    }
+
+    required.sort();
+    required.dedup();
+    if required.is_empty() {
+        debug!(
+            "preload_shared_native_deps: no intra-payload native dependencies in {}",
+            libs_dir
+        );
+        return Ok(());
+    }
+
+    let mut ordered: Vec<String> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    for path in &required {
+        visit_native_deps(path, &needed_by_path, &mut visited, &mut ordered);
+    }
+
+    debug!(
+        "preload_shared_native_deps: dependency order for {}: {:?}",
+        libs_dir, ordered
+    );
+
+    let failures = load_paths_via_java(env, &ordered)?;
+    info!(
+        "preload_shared_native_deps: pre-loaded {}/{} shared native dependencies from {}",
+        ordered.len().saturating_sub(failures as usize),
+        ordered.len(),
         libs_dir
     );
     Ok(())
@@ -1371,6 +1844,15 @@ fn land_payload_files(
     let dex_cache_dir = format!("{}/dex_landing", cache_path);
     std::fs::create_dir_all(&dex_cache_dir).unwrap_or(());
 
+    // API 24/25 still honour DexClassLoader's optimizedDirectory, and ART
+    // derives the oat output path as "<optimizedDirectory>/<dexFileName>".
+    // Handing it the landing directory itself therefore makes the oat path
+    // identical to the source dex (which is chmod 0444), so dex2oat fails, the
+    // DexPathList$Element keeps a null DexFile and every payload class goes
+    // missing at startup. Keep the optimized output in its own directory.
+    let dex_opt_dir = format!("{}/dex_opt", cache_path);
+    std::fs::create_dir_all(&dex_opt_dir).unwrap_or(());
+
     let libs_dir = format!("{}/native_libs", cache_path);
     std::fs::create_dir_all(&libs_dir).unwrap_or(());
 
@@ -1409,7 +1891,7 @@ fn land_payload_files(
         }
     }
 
-    Ok((dex_paths, libs_dir, dex_cache_dir))
+    Ok((dex_paths, libs_dir, dex_opt_dir))
 }
 
 fn register_payload_on_loader(
@@ -1417,7 +1899,7 @@ fn register_payload_on_loader(
     target_loader: &JObject,
     dex_paths: &[String],
     libs_dir: &str,
-    dex_cache_dir: &str,
+    dex_opt_dir: &str,
 ) -> Result<(), jni::errors::Error> {
     let joined_paths = dex_paths.join(":");
 
@@ -1440,7 +1922,7 @@ fn register_payload_on_loader(
             target_loader,
             &joined_paths,
             libs_dir,
-            dex_cache_dir,
+            dex_opt_dir,
         )?;
     }
 
@@ -1474,6 +1956,21 @@ fn register_payload_on_loader(
                     e2
                 );
             }
+        }
+    }
+
+    // Runs regardless of which registration path above succeeded: the linker
+    // namespace was already created - and its ld_library_path frozen - when
+    // ShellApplication's static block loaded libshell.so, so DT_NEEDED entries
+    // pointing at sibling payload libraries cannot be resolved by path injection
+    // alone. Those siblings have to be dlopen'ed explicitly, dependencies first.
+    if let Err(e) = preload_shared_native_deps(env, libs_dir) {
+        warn!(
+            "register_payload_on_loader: preload_shared_native_deps failed: {:?}",
+            e
+        );
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
         }
     }
 

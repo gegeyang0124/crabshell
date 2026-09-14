@@ -1423,12 +1423,18 @@ def pack_apk(
             # but we can use keytool to get the cert hash.
             keytool = shutil.which("keytool")
             if keytool:
+                # keytool writes its report in the platform console encoding
+                # (cp936 on a Chinese Windows), so a strict UTF-8 decode raised
+                # UnicodeDecodeError here, which silently downgraded the build to
+                # "signature check disabled" even when a real keystore was given.
+                # The fingerprint line itself is pure ASCII, so a lossy decode
+                # keeps the parsing below working on any locale.
                 out = subprocess.check_output([
                     keytool, "-list", "-v", 
                     "-keystore", keystore, 
                     "-storepass", ks_pass, 
                     "-alias", key_alias
-                ]).decode()
+                ]).decode("utf-8", errors="replace")
                 for line in out.splitlines():
                     if "SHA256:" in line:
                         hash_str = line.split(":", 1)[1].strip().replace(":", "")
@@ -1438,7 +1444,8 @@ def pack_apk(
             print(f"Warning: Failed to get signature hash from keystore: {e}")
 
     if not signature_hash:
-        print("Warning: Could not determine signature hash. Using dummy value.")
+        print("Notice: no signature hash embedded - runtime signature verification is disabled.")
+        print("        Pass --keystore/--ks-pass/--key-alias of the FINAL signer to enable it.")
         signature_hash = b'\x00' * 32
 
     # Re-generate configs with hashes
@@ -1637,10 +1644,21 @@ def get_default_debug_signing() -> Tuple[str, str, str]:
     return debug_keystore, debug_password, debug_alias
 
 def resolve_signing(
-    keystore: Optional[str], ks_pass: Optional[str], key_alias: Optional[str]
+    keystore: Optional[str], ks_pass: Optional[str], key_alias: Optional[str],
+    no_sign: bool = False,
 ) -> Tuple[str, str, Optional[str]]:
     if keystore and ks_pass:
         return keystore, ks_pass, key_alias
+
+    if no_sign:
+        # The packer is not the one signing here, so the final certificate is
+        # unknown at this point. Falling back to the debug keystore would embed
+        # the debug cert fingerprint, and the runtime would then compare it
+        # against the real signer and abort with "Signature mismatch". Return an
+        # empty config so pack_apk writes an all-zero hash, which
+        # validate_signature_hash() treats as "verification disabled".
+        print("No signing config provided and --no-sign set: leaving signature hash unset.")
+        return "", "", None
 
     print("No signing config provided. Falling back to Android debug keystore.")
     return get_default_debug_signing()
@@ -1830,7 +1848,7 @@ def main():
         )
         emit_progress("init.rules.resolve", 27, "Runtime include/exclude rules resolved")
 
-        signing_keystore, signing_ks_pass, signing_alias = resolve_signing(keystore, ks_pass, key_alias)
+        signing_keystore, signing_ks_pass, signing_alias = resolve_signing(keystore, ks_pass, key_alias, no_sign)
         emit_progress("init.signing.resolve", 30, "Signing configuration resolved")
 
         # apksigner only supports APK. For AAB output, keep an intermediate APK and

@@ -1119,11 +1119,23 @@ fn inject_native_lib_dir(
     env: &mut JNIEnv,
     target_loader: &JObject,
     libs_dir: &str,
+    dex_opt_dir: &str,
 ) -> Result<(), jni::errors::Error> {
     // No dex files on this helper loader: it exists purely to obtain a
     // correctly constructed DexPathList$Element for libs_dir on the current
     // platform version.
-    let helper = create_helper_dex_loader(env, target_loader, "", None, libs_dir)?;
+    //
+    // optimizedDirectory MUST be non-null on API 24/25. There DexClassLoader's
+    // constructor runs `new File(optimizedDirectory)`, which throws
+    // NullPointerException for a null argument and aborts the whole injection,
+    // so libs_dir never reaches nativeLibraryPathElements and every
+    // System.loadLibrary(name) the original app makes (Baidu's "liantian",
+    // ZXManager's "zxprotect", ...) dies with UnsatisfiedLinkError "couldn't
+    // find ..." even though the .so was already preloaded by absolute path.
+    // API 26+ ignores the parameter, which is why only Android 7 regressed. The
+    // helper carries no dex, so any existing writable dir satisfies the
+    // constructor; reuse the dex_opt dir land_payload_files already created.
+    let helper = create_helper_dex_loader(env, target_loader, "", Some(dex_opt_dir), libs_dir)?;
     inject_native_dir_from_loader(env, &helper, target_loader, libs_dir)
 }
 
@@ -1717,8 +1729,14 @@ fn preload_shared_native_deps(env: &mut JNIEnv, libs_dir: &str) -> Result<(), jn
 }
 
 fn get_element_path(env: &mut JNIEnv, element: &JObject) -> Option<String> {
-    // The field was renamed from "file" to "path" across platform releases.
-    for field_name in ["path", "file"] {
+    // DexPathList$Element names its directory field differently per platform
+    // release: "path" on Android 9+, "dir" on Android 5-8 (verified against a
+    // real 7.1.2 core-libart.jar) and "file" on some older/OEM builds. Omitting
+    // "dir" made every element unmatchable on Android 7, so
+    // inject_native_dir_from_loader harvested nothing and libs_dir never landed
+    // in nativeLibraryPathElements - findLibrary() then returned null for every
+    // payload .so the original app loaded by name.
+    for field_name in ["path", "dir", "file"] {
         let field = match env.get_field(element, field_name, "Ljava/io/File;") {
             Ok(value) => value,
             Err(_) => {
@@ -1869,6 +1887,18 @@ fn land_payload_files(
         info!("land_payload_files: cache is valid, skipping file extraction");
     }
 
+    // Lib filenames that belong to the CURRENT payload for this ABI. Anything
+    // else left in native_libs is stale: e.g. a lib an older build encrypted
+    // into the payload but a newer build keeps in the APK via --keep-lib. Such
+    // leftovers are dangerous because preload_shared_native_deps scans this
+    // directory and System.load()s every intra-dir dependency it finds, so a
+    // stale libonnxruntime.so gets force-loaded from the writable data dir. On
+    // Android 7 that breaks ONNX Runtime composite engine init
+    // (bdface_create_instance -> -13, i.e. the matting / dark-enhance
+    // abilities fail) even though the APK carries a good copy in its own lib
+    // dir. Collect the expected set here and purge the rest after landing.
+    let mut expected_libs: HashSet<String> = HashSet::new();
+
     for (i, (name, data)) in file_list.iter().enumerate() {
         if name.ends_with(".dex") {
             let dex_path = format!("{}/payload_{}.dex", dex_cache_dir, i);
@@ -1882,10 +1912,41 @@ fn land_payload_files(
             dex_paths.push(dex_path);
         } else if name.starts_with(&lib_prefix) && name.ends_with(".so") {
             let filename = name.strip_prefix(&lib_prefix).unwrap_or(name);
+            expected_libs.insert(filename.to_string());
             let lib_path = format!("{}/{}", libs_dir, filename);
             if !cache_ok && !data.is_empty() {
                 if let Err(e) = atomic_write(&lib_path, data, false) {
                     error!("land_payload_files: failed to write lib {}: {}", lib_path, e);
+                }
+            }
+        }
+    }
+
+    // Purge stale .so files that are no longer part of the payload. Guarded on
+    // a non-empty expected set so a dex-only or empty payload never wipes a
+    // directory we cannot fully describe.
+    if !expected_libs.is_empty() {
+        if let Ok(dir) = std::fs::read_dir(&libs_dir) {
+            for entry in dir.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("so") {
+                    continue;
+                }
+                let fname = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if !expected_libs.contains(fname) {
+                    match std::fs::remove_file(&path) {
+                        Ok(_) => info!(
+                            "land_payload_files: purged stale native lib not in payload: {}",
+                            fname
+                        ),
+                        Err(e) => warn!(
+                            "land_payload_files: failed to purge stale native lib {}: {}",
+                            fname, e
+                        ),
+                    }
                 }
             }
         }
@@ -1936,7 +1997,7 @@ fn register_payload_on_loader(
         info!(
             "register_payload_on_loader: addNativePath unavailable, using native path element injection"
         );
-        if let Err(e) = inject_native_lib_dir(env, target_loader, libs_dir) {
+        if let Err(e) = inject_native_lib_dir(env, target_loader, libs_dir, dex_opt_dir) {
             warn!(
                 "register_payload_on_loader: inject_native_lib_dir failed: {:?}, clearing JNI exception",
                 e

@@ -24,8 +24,11 @@ cd /d F:\jiagou\crabshell
 :: 直到调用native方法才暴露为 "No implementation found ... FaceAuth.nativeSetCoreConfigure"。
 :: 仅系统库依赖的so(如libserial_port.so)不受影响,故只有人脸SDK崩溃。
 :: 解决:用 --keep-lib 把这一整簇存在“payload内部互相依赖”的库保留为STORED明文留在APK内,
-:: 使其加载路径与 DT_NEEDED 解析与加固前完全一致(zipalign -p 会重新页对齐,满足 extractNativeLibs=false)。
-set KEEP_LIBS=--keep-lib bdface_sdk --keep-lib bd_facecollect_unifylicense --keep-lib onnxruntime --keep-lib c++_shared --keep-lib aikl_calc_arm --keep-lib aikl_cluster_arm
+:: 使其加载路径与 DT_NEEDED 解析与加固前完全一致(zipalign -p 会重新页对齐,满足 extractNativeLibs=false)。::
+:: 弘圣H212: libdk_serial_port.so 的 DT_SONAME 与 libserial_port.so 撞名(厂商改名同源库),payload化后在H212的
+:: OEM ROM上壳DexPathList补丁失效时预加载登记SONAME而非文件名,loadLibrary按名dlopen报not found崩溃。
+:: 解决: 该撞名库对保留STORED明文在APK内, 加载语义与加固前一致。
+set KEEP_LIBS=--keep-lib bdface_sdk --keep-lib bd_facecollect_unifylicense --keep-lib onnxruntime --keep-lib c++_shared --keep-lib aikl_calc_arm --keep-lib aikl_cluster_arm --keep-lib dk_serial_port --keep-lib serial_port
 
 :: 逐个加固当前目录所有apk(跳过已加固的*_unsigned.apk)
 for %%F in ("%~dp0*.apk") do (

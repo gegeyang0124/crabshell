@@ -1,4 +1,10 @@
 # CrabShell 🦀（Android 加固工具包）
+此库本人优化了算法：
+1.解决了一些so无法正常加载的问
+2.优化不适配大多Android设备，加固后无法正常运行问题
+3.添加了加固命令[sign/strong_cmd.bat](sign/strong_cmd.bat)和加签命令[sign/sign_cmd.bat](sign/sign_cmd.bat)
+4.替换签名文件[sign/strong_cmd.bat](signpos_123456.jks),文件命名规则“别名_密码.jks”
+5.同时加固并加签执行[sign/cmd_strong_sign](sign/scmd_strong_sign)即可
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Build Status](https://github.com/kexuejin/crabshell/actions/workflows/build.yml/badge.svg)

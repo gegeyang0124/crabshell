@@ -1,5 +1,12 @@
 # CrabShell 🦀 (Android Hardening Toolkit)
 
+I have optimized the algorithms in this library:
+1. Fixed issues where some `.so` libraries failed to load properly.
+2. Improved compatibility with most Android devices, fixing the problem of apps failing to run normally after hardening.
+3. Added the hardening command [sign/strong_cmd.bat](sign/strong_cmd.bat) and the signing command [sign/sign_cmd.bat](sign/sign_cmd.bat).
+4. Replaced the signing keystore [sign/sign_123456.jks](sign/sign_123456.jks); keystore files follow the naming rule `alias_password.jks`.
+5. To harden and sign in one step, simply run [sign/cmd_strong_sign.bat](sign/cmd_strong_sign.bat).
+
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Build Status](https://github.com/kexuejin/crabshell/actions/workflows/build.yml/badge.svg)
 ![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)

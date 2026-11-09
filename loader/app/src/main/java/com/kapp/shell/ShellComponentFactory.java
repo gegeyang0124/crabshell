@@ -12,7 +12,7 @@ import android.util.Log;
 
 public class ShellComponentFactory extends AppComponentFactory {
     private static final String TAG = "ShellComponentFactory";
-    public static final String ORIGINAL_APP = "co.vbyte.zhihuishitang_pos.MyApplication";
+    public static final String ORIGINAL_APP = "";
     public static final String ORIGINAL_FACTORY = "androidx.core.app.CoreComponentFactory";
     private static ApplicationInfo sAppInfo;
     private AppComponentFactory originalFactory;

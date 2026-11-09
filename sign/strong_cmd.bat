@@ -28,7 +28,11 @@ cd /d F:\jiagou\crabshell
 :: 弘圣H212: libdk_serial_port.so 的 DT_SONAME 与 libserial_port.so 撞名(厂商改名同源库),payload化后在H212的
 :: OEM ROM上壳DexPathList补丁失效时预加载登记SONAME而非文件名,loadLibrary按名dlopen报not found崩溃。
 :: 解决: 该撞名库对保留STORED明文在APK内, 加载语义与加固前一致。
-set KEEP_LIBS=--keep-lib bdface_sdk --keep-lib bd_facecollect_unifylicense --keep-lib onnxruntime --keep-lib c++_shared --keep-lib aikl_calc_arm --keep-lib aikl_cluster_arm --keep-lib dk_serial_port --keep-lib serial_port
+:: mealorder(Flutter应用): libflutter.so/libapp.so/libdartjni.so/libdatastore_shared_counter.so 被payload化后,
+:: 壳注入native_lib_dir失败回退System.load从cache目录加载,引擎在FlutterJNI.performNativeAttach处SIGSEGV崩溃
+:: (fault addr in libflutter.so)。Flutter引擎要求库从APK原生lib目录按标准语义加载。
+:: 解决: 整个Flutter库簇保留STORED明文留在APK内(zipalign -p 重新页对齐),DEX仍加密加固不受影响。
+set KEEP_LIBS=--keep-lib bdface_sdk --keep-lib bd_facecollect_unifylicense --keep-lib onnxruntime --keep-lib c++_shared --keep-lib aikl_calc_arm --keep-lib aikl_cluster_arm --keep-lib dk_serial_port --keep-lib serial_port --keep-lib flutter --keep-lib app --keep-lib dartjni --keep-lib datastore_shared_counter
 
 :: 逐个加固当前目录所有apk(跳过已加固的*_unsigned.apk)
 for %%F in ("%~dp0*.apk") do (
